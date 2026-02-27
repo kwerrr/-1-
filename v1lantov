@@ -1,0 +1,1231 @@
+import asyncio
+import logging
+import secrets
+from datetime import datetime
+from typing import Optional, Dict, List
+from enum import Enum
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.markdown import hbold, hcode
+import configparser
+
+# Чтение конфигурации
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+BOT_TOKEN = '8714821121:AAFKvwqVqpFsJx7VkzumMlADI-a7-1137oQ'
+ADMIN_IDS = '8204548296'
+SUPPORT_USERNAME = 'SupPlayerook'
+WEBSITE_URL = 'https://playerok.com'
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# Константы
+SUPPORTED_CURRENCIES = {
+    'STARS': '⭐ STARS',
+    'TON': '💎 TON',
+    'RUB': '🇷🇺 RUB',
+    'KZT': '🇰🇿 KZT',
+    'BYN': '🇧🇾 BYN',
+    'UAH': '🇺🇦 UAH'
+}
+
+class DealStatus(Enum):
+    PENDING = 'pending'
+    PAID = 'paid'
+    NFT_SENT = 'nft_sent'
+    COMPLETED = 'completed'
+    DISPUTE = 'dispute'
+    CANCELLED = 'cancelled'
+
+class UserRole(Enum):
+    USER = 'user'
+    ADMIN = 'admin'
+
+# Состояния FSM
+class DealCreation(StatesGroup):
+    checking_requisites = State()
+    choosing_currency = State()
+    entering_amount = State()
+    entering_description = State()
+    confirming = State()
+
+class RequisitesManagement(StatesGroup):
+    choosing_type = State()
+    entering_card = State()
+    entering_phone = State()
+    entering_stars = State()
+    entering_ton_wallet = State()
+    confirming = State()
+
+class AdminActions(StatesGroup):
+    adding_balance = State()
+    adding_successful_deals = State()
+    sending_broadcast = State()
+    managing_deal = State()
+
+# База данных (в реальном проекте используйте PostgreSQL/MySQL)
+class Database:
+    def __init__(self):
+        self.users: Dict[int, dict] = {}
+        self.deals: Dict[str, dict] = {}
+        
+    def get_user(self, user_id: int) -> dict:
+        if user_id not in self.users:
+            # Проверяем, является ли пользователь админом
+            role = UserRole.ADMIN.value if str(user_id) in ADMIN_IDS else UserRole.USER.value
+            self.users[user_id] = {
+                'user_id': user_id,
+                'username': None,
+                'first_name': None,
+                'role': role,
+                'balance': 0,
+                'total_turnover': 0,
+                'successful_deals': 0,
+                'created_at': datetime.now().isoformat(),
+                'deals': [],
+                'requisites': {
+                    'card': None,
+                    'phone': None,
+                    'stars': None,
+                    'ton_wallet': None
+                },
+                'has_requisites': False
+            }
+        return self.users[user_id]
+    
+    def update_user(self, user_id: int, **kwargs):
+        if user_id in self.users:
+            self.users[user_id].update(kwargs)
+    
+    def add_requisite(self, user_id: int, type: str, value: str):
+        if user_id in self.users:
+            self.users[user_id]['requisites'][type] = value
+            # Проверяем, есть ли хотя бы один реквизит
+            req = self.users[user_id]['requisites']
+            self.users[user_id]['has_requisites'] = bool(req['card'] or req['phone'] or req['stars'] or req['ton_wallet'])
+    
+    def get_requisites(self, user_id: int) -> dict:
+        return self.users.get(user_id, {}).get('requisites', {'card': None, 'phone': None, 'stars': None, 'ton_wallet': None})
+    
+    def create_deal(self, creator_id: int, currency: str, amount: float, description: str) -> str:
+        # Генерируем случайный уникальный ID с символом #
+        while True:
+            random_part = secrets.token_hex(4).upper()
+            deal_id = f"#{random_part}"
+            if deal_id not in self.deals:
+                break
+        
+        self.deals[deal_id] = {
+            'deal_id': deal_id,
+            'creator_id': creator_id,
+            'buyer_id': None,
+            'currency': currency,
+            'amount': amount,
+            'description': description,
+            'status': DealStatus.PENDING.value,
+            'created_at': datetime.now().isoformat(),
+            'paid_at': None,
+            'completed_at': None,
+            'nft_proof': None,
+            'gift_sent_at': None
+        }
+        
+        # Добавляем сделку в список пользователя
+        self.users[creator_id]['deals'].append(deal_id)
+        
+        return deal_id
+    
+    def get_deal(self, deal_id: str) -> Optional[dict]:
+        return self.deals.get(deal_id)
+    
+    def update_deal(self, deal_id: str, **kwargs):
+        if deal_id in self.deals:
+            self.deals[deal_id].update(kwargs)
+    
+    def get_user_deals(self, user_id: int) -> List[dict]:
+        user_deals = []
+        for deal_id, deal in self.deals.items():
+            if deal['creator_id'] == user_id or deal.get('buyer_id') == user_id:
+                user_deals.append(deal)
+        return user_deals
+    
+    def get_all_deals(self) -> List[dict]:
+        return list(self.deals.values())
+    
+    def get_pending_deals(self) -> List[dict]:
+        return [d for d in self.deals.values() if d['status'] == DealStatus.PENDING.value]
+    
+    def get_active_deals(self) -> List[dict]:
+        active_statuses = [DealStatus.PENDING.value, DealStatus.PAID.value, DealStatus.NFT_SENT.value]
+        return [d for d in self.deals.values() if d['status'] in active_statuses]
+
+db = Database()
+
+# Клавиатуры
+def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛡 Создать сделку", callback_data="create_deal")
+    builder.button(text="👤 Профиль", callback_data="show_profile")
+    builder.button(text="💳 Мои реквизиты", callback_data="manage_requisites")
+    builder.button(text="🌐 Наш сайт", url=WEBSITE_URL)
+    builder.button(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")
+    
+    # Добавляем кнопку админ-панели для администраторов
+    user = db.get_user(user_id)
+    if user['role'] == UserRole.ADMIN.value:
+        builder.button(text="👑 Админ панель", callback_data="admin_panel")
+    
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_requisites_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Добавить карту", callback_data="add_card")
+    builder.button(text="📱 Добавить телефон (СБП)", callback_data="add_phone")
+    builder.button(text="⭐ Добавить STARS (username)", callback_data="add_stars")
+    builder.button(text="💎 Добавить TON кошелек", callback_data="add_ton_wallet")
+    builder.button(text="👁 Показать мои реквизиты", callback_data="show_requisites")
+    builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_currencies_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for code, name in SUPPORTED_CURRENCIES.items():
+        builder.button(text=name, callback_data=f"currency_{code}")
+    builder.button(text="🔙 Отмена", callback_data="cancel")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_deal_actions_keyboard(deal_id: str, user_role: str = UserRole.USER.value, user_id: int = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    deal = db.get_deal(deal_id)
+    
+    if deal['status'] == DealStatus.PENDING.value:
+        builder.button(text="💳 Оплатить", callback_data=f"pay_{deal_id}")
+        builder.button(text="❌ Отменить", callback_data=f"cancel_{deal_id}")
+    
+    # Кнопка для продавца "Подарок отправлен" после оплаты
+    if deal['status'] == DealStatus.PAID.value and user_id == deal['creator_id']:
+        builder.button(text="🎁 Подарок отправлен", callback_data=f"gift_sent_{deal_id}")
+    
+    if user_role == UserRole.ADMIN.value:
+        if deal['status'] == DealStatus.NFT_SENT.value:
+            builder.button(text="✅ Завершить сделку", callback_data=f"admin_complete_{deal_id}")
+        elif deal['status'] == DealStatus.DISPUTE.value:
+            builder.button(text="⚖️ Решить спор", callback_data=f"admin_resolve_{deal_id}")
+    
+    builder.button(text="🔄 Обновить", callback_data=f"refresh_{deal_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика", callback_data="admin_stats")
+    builder.button(text="💼 Управление сделками", callback_data="admin_deals")
+    builder.button(text="💰 Накрутить обороты", callback_data="admin_add_turnover")
+    builder.button(text="✅ Накрутить успешные сделки", callback_data="admin_add_success")
+    builder.button(text="📢 Рассылка", callback_data="admin_broadcast")
+    builder.button(text="👥 Пользователи", callback_data="admin_users")
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_back_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
+    return builder.as_markup()
+
+# Обработчики команд
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, command: CommandStart):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    
+    # Обновляем информацию о пользователе
+    db.update_user(user_id, 
+                   username=message.from_user.username,
+                   first_name=message.from_user.first_name)
+    
+    # Проверяем, не перешли ли по ссылке с параметром deal_...
+    args = command.args
+    if args and args.startswith("deal_"):
+        clean_deal_id = args[5:].upper()
+        deal_id = f"#{clean_deal_id}"
+        deal = db.get_deal(deal_id)
+        
+        if not deal:
+            await message.answer("❌ Сделка не найдена")
+            return
+            
+        if deal['status'] != DealStatus.PENDING.value:
+            await message.answer("❌ Эта сделка уже не доступна для оплаты")
+            return
+            
+        if deal['creator_id'] == user_id:
+            await message.answer("❌ Вы не можете оплатить свою собственную сделку")
+            return
+        
+        # Получаем информацию о продавце
+        seller = db.get_user(deal['creator_id'])
+        
+        # Отправляем уведомление продавцу о присоединении покупателя
+        try:
+            buyer_info = f"👤 Покупатель: {message.from_user.first_name}"
+            if message.from_user.username:
+                buyer_info += f" (@{message.from_user.username})"
+            
+            await bot.send_message(
+                deal['creator_id'],
+                f"{hbold('👋 Покупатель присоединился к сделке!')}\n\n"
+                f"{buyer_info}\n"
+                f"ID сделки: {hcode(deal_id)}\n\n"
+                f"📊 Статистика покупателя:\n"
+                f"✅ Успешных сделок: {user['successful_deals']}\n"
+                f"💰 Оборот: {user['total_turnover']} RUB",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify seller: {e}")
+        
+        # Показываем информацию о сделке
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💳 Оплатить", callback_data=f"pay")
+        ]])
+        
+        await message.answer(
+            f"Вы хотите оплатить сделку:\n\n"
+            f"ID: {deal_id}\n"
+            f"👤 Продавец: {seller['first_name']} (@{seller['username']})\n"
+            f"📊 Статистика продавца:\n"
+            f"✅ Успешных сделок: {seller['successful_deals']}\n"
+            f"💰 Оборот: {seller['total_turnover']} RUB\n\n"
+            f"Сумма: {deal['amount']} {SUPPORTED_CURRENCIES[deal['currency']]}\n"
+            f"Описание: {deal['description']}\n\n"
+            f"Нажмите кнопку 'Оплатить', чтобы продолжить.",
+            reply_markup=kb
+        )
+        return
+    
+    # Приветственное сообщение для новых пользователей
+    welcome_text = (
+        f"{hbold('👋 Добро пожаловать в Playerok!')}\n\n"
+        f"Сервис, обеспечивающий безопасность и удобство проведения сделок.\n\n"
+        f"📢 Наш канал — @playerok_com\n"
+        f"🛟 Поддержка — @SupPlayerook\n\n"
+        f"👇 Нажмите кнопку ниже, чтобы продолжить"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="▶️ Продолжить", callback_data="continue_to_main")
+    ]])
+    
+    await message.answer(welcome_text, reply_markup=kb, parse_mode="HTML")
+
+# Скрытая команда для быстрой оплаты сделки (без подтверждения)
+@dp.message(Command("fastbuy"))
+async def fast_buy(message: types.Message):
+    # Получаем ID сделки из команды
+    command_parts = message.text.split()
+    
+    if len(command_parts) != 2:
+        await message.answer(
+            "❌ Неправильный формат команды.\n"
+        )
+        return
+    
+    deal_id_input = command_parts[1].upper()
+    
+    # Добавляем # если его нет
+    if not deal_id_input.startswith('#'):
+        deal_id = f"#{deal_id_input}"
+    else:
+        deal_id = deal_id_input
+    
+    deal = db.get_deal(deal_id)
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    
+    if not deal:
+        await message.answer("❌ Сделка с таким ID не найдена")
+        return
+    
+    if deal['status'] != DealStatus.PENDING.value:
+        await message.answer("❌ Эта сделка уже не доступна для оплаты")
+        return
+    
+    if deal['creator_id'] == user_id:
+        await message.answer("❌ Вы не можете оплатить свою собственную сделку")
+        return
+    
+    # Обновляем сделку
+    db.update_deal(deal_id,
+                   buyer_id=user_id,
+                   status=DealStatus.PAID.value,
+                   paid_at=datetime.now().isoformat())
+    
+    # Получаем информацию о покупателе
+    buyer = db.get_user(user_id)
+    
+    # Создаем клавиатуру с кнопкой "Подарок отправлен" для продавца
+    seller_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎁 Подарок отправлен", callback_data=f"gift_sent_{deal_id}")
+    ]])
+    
+    # Уведомляем продавца
+    seller_id = deal['creator_id']
+    try:
+        seller_notification = (
+            f"{hbold('💰 Получена оплата по сделке!')}\n\n"
+            f"ID сделки: {hcode(deal_id)}\n"
+            f"Сумма: {deal['amount']} {SUPPORTED_CURRENCIES[deal['currency']]}\n\n"
+            f"Информация о покупателе:\n"
+            f"👤 Имя: {buyer['first_name']}\n"
+            f"📊 Успешных сделок: {buyer['successful_deals']}\n"
+            f"💰 Оборот: {buyer['total_turnover']} RUB\n\n"
+            f"Пожалуйста, отправьте NFT поддержке @supporOTC\n\n"
+            f"После отправки подарка нажмите кнопку ниже:"
+        )
+        await bot.send_message(
+            seller_id, 
+            seller_notification, 
+            reply_markup=seller_keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Failed to notify seller: {e}")
+    
+    # Уведомляем покупателя об успешной оплате
+    await message.answer(
+        f"{hbold('✅ Оплата зарегистрирована!')}\n\n"
+        f"ID сделки: {hcode(deal_id)}\n"
+        f"Сумма: {deal['amount']} {SUPPORTED_CURRENCIES[deal['currency']]}\n\n"
+        f"Продавец уведомлен. Ожидайте, пока он отправит подарок гаранту.\n"
+        f"После отправки вы получите уведомление.",
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(lambda c: c.data == "continue_to_main")
+async def continue_to_main(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    
+    await callback.message.edit_text(
+        f"{hbold('🛡 Playerok Bot | OTC')}\n\n"
+        f"Безопасный и удобный сервис для сделок!\n\n"
+        f"🔹 {hbold('Как это работает:')}\n"
+        f"1. Продавец создает сделку\n"
+        f"2. Покупатель оплачивает сделку по реквизитам\n"
+        f"3. Продавец отправляет NFT поддержке\n"
+        f"4. Поддержка проверяет и завершает сделку\n\n"
+        f"{hbold('👇 Выберите действие:')}",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        f"{hbold('🛡 Playerok Bot | OTC')}\n\n"
+        f"{hbold('👇 Выберите действие:')}",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "manage_requisites")
+async def manage_requisites(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        f"{hbold('💳 Управление реквизитами')}\n\n"
+        f"Добавьте свои реквизиты для получения оплаты:\n"
+        f"• Банковская карта\n"
+        f"• Номер телефона (СБП)\n"
+        f"• STARS (юзернейм)\n"
+        f"• TON кошелек\n\n"
+        f"Выберите действие:",
+        reply_markup=get_requisites_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "add_card")
+async def add_card_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RequisitesManagement.entering_card)
+    await callback.message.edit_text(
+        "💳 Введите номер банковской карты:\n"
+        "(только цифры, 16-20 символов)"
+    )
+    await callback.answer()
+
+@dp.message(RequisitesManagement.entering_card)
+async def process_card(message: types.Message, state: FSMContext):
+    card = message.text.replace(' ', '').replace('-', '')
+    
+    if not card.isdigit() or len(card) < 16 or len(card) > 20:
+        await message.answer("❌ Неверный формат карты. Попробуйте снова:")
+        return
+    
+    user_id = message.from_user.id
+    db.add_requisite(user_id, 'card', card)
+    
+    await state.clear()
+    await message.answer("✅ Карта успешно добавлена!")
+    
+    # Показываем меню реквизитов
+    await show_requisites_menu(message)
+
+@dp.callback_query(lambda c: c.data == "add_phone")
+async def add_phone_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RequisitesManagement.entering_phone)
+    await callback.message.edit_text(
+        "📱 Введите номер телефона для СБП:\n"
+        "(в формате 79991234567 или +79991234567)"
+    )
+    await callback.answer()
+
+@dp.message(RequisitesManagement.entering_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.text.replace('+', '').replace(' ', '').replace('-', '')
+    
+    if not phone.isdigit() or len(phone) < 10 or len(phone) > 15:
+        await message.answer("❌ Неверный формат телефона. Попробуйте снова:")
+        return
+    
+    user_id = message.from_user.id
+    db.add_requisite(user_id, 'phone', phone)
+    
+    await state.clear()
+    await message.answer("✅ Телефон успешно добавлен!")
+    
+    # Показываем меню реквизитов
+    await show_requisites_menu(message)
+
+@dp.callback_query(lambda c: c.data == "add_stars")
+async def add_stars_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RequisitesManagement.entering_stars)
+    await callback.message.edit_text(
+        "⭐ Введите username для STARS:\n"
+        "(например: @username или username)"
+    )
+    await callback.answer()
+
+@dp.message(RequisitesManagement.entering_stars)
+async def process_stars(message: types.Message, state: FSMContext):
+    stars = message.text.strip()
+    
+    # Убираем @ если есть
+    if stars.startswith('@'):
+        stars = stars[1:]
+    
+    if len(stars) < 3 or len(stars) > 32:
+        await message.answer("❌ Неверный формат username. Попробуйте снова:")
+        return
+    
+    user_id = message.from_user.id
+    db.add_requisite(user_id, 'stars', stars)
+    
+    await state.clear()
+    await message.answer("✅ STARS username успешно добавлен!")
+    
+    # Показываем меню реквизитов
+    await show_requisites_menu(message)
+
+@dp.callback_query(lambda c: c.data == "add_ton_wallet")
+async def add_ton_wallet_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RequisitesManagement.entering_ton_wallet)
+    await callback.message.edit_text(
+        "💎 Введите адрес TON кошелька:\n"
+        "(формат: UQ... или EQ...)"
+    )
+    await callback.answer()
+
+@dp.message(RequisitesManagement.entering_ton_wallet)
+async def process_ton_wallet(message: types.Message, state: FSMContext):
+    ton_wallet = message.text.strip()
+    
+    # Простая проверка формата TON кошелька
+    if not (ton_wallet.startswith('UQ') or ton_wallet.startswith('EQ')) or len(ton_wallet) < 40:
+        await message.answer("❌ Неверный формат TON кошелька. Попробуйте снова:")
+        return
+    
+    user_id = message.from_user.id
+    db.add_requisite(user_id, 'ton_wallet', ton_wallet)
+    
+    await state.clear()
+    await message.answer("✅ TON кошелек успешно добавлен!")
+    
+    # Показываем меню реквизитов
+    await show_requisites_menu(message)
+
+@dp.callback_query(lambda c: c.data == "show_requisites")
+async def show_requisites(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    req = db.get_requisites(user_id)
+    
+    text = f"{hbold('💳 Ваши реквизиты:')}\n\n"
+    
+    if req['card']:
+        # Маскируем номер карты
+        masked_card = f"**** **** **** {req['card'][-4:]}"
+        text += f"💳 Карта: {masked_card}\n"
+    else:
+        text += "💳 Карта: не добавлена\n"
+    
+    if req['phone']:
+        text += f"📱 Телефон: +{req['phone']}\n"
+    else:
+        text += "📱 Телефон: не добавлен\n"
+    
+    if req['stars']:
+        text += f"⭐ STARS: @{req['stars']}\n"
+    else:
+        text += "⭐ STARS: не добавлен\n"
+    
+    if req['ton_wallet']:
+        # Маскируем кошелек для безопасности
+        masked_wallet = f"{req['ton_wallet'][:4]}...{req['ton_wallet'][-4:]}"
+        text += f"💎 TON: {masked_wallet}\n"
+    else:
+        text += "💎 TON: не добавлен\n"
+    
+    await callback.message.edit_text(text, reply_markup=get_requisites_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+async def show_requisites_menu(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer(
+        f"{hbold('💳 Управление реквизитами')}\n\n"
+        f"Выберите действие:",
+        reply_markup=get_requisites_keyboard(),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(lambda c: c.data == "create_deal")
+async def create_deal_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    
+    # Проверяем наличие реквизитов
+    if not user['has_requisites']:
+        await callback.message.edit_text(
+            f"{hbold('❌ Необходимо добавить реквизиты!')}\n\n"
+            f"Для создания сделки вам нужно добавить хотя бы один способ получения оплаты:\n"
+            f"• Банковская карта\n"
+            f"• Номер телефона (СБП)\n"
+            f"• STARS (юзернейм)\n"
+            f"• TON кошелек\n\n"
+            f"Перейдите в раздел 'Мои реквизиты' для добавления.",
+            reply_markup=get_requisites_keyboard(),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+    
+    await state.set_state(DealCreation.choosing_currency)
+    await callback.message.edit_text(
+        "Выберите валюту для сделки:",
+        reply_markup=get_currencies_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "show_profile")
+async def show_profile(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    user_deals = db.get_user_deals(user_id)
+    
+    active_deals = [d for d in user_deals if d['status'] in [DealStatus.PENDING.value, DealStatus.PAID.value, DealStatus.NFT_SENT.value]]
+    completed_deals = [d for d in user_deals if d['status'] == DealStatus.COMPLETED.value]
+    
+    profile_text = (
+        f"{hbold('👤 Ваш профиль')}\n\n"
+        f"ID: {user_id}\n"
+        f"Имя: {user['first_name']}\n"
+        f"Username: @{user['username'] if user['username'] else 'отсутствует'}\n"
+        f"Роль: {'Администратор' if user['role'] == 'admin' else 'Пользователь'}\n\n"
+        f"{hbold('📊 Статистика:')}\n"
+        f"💰 Всего сделок: {len(user_deals)}\n"
+        f"🔄 Активных сделок: {len(active_deals)}\n"
+        f"✅ Успешных сделок: {user['successful_deals']}\n"
+        f"📈 Оборот: {user['total_turnover']} RUB\n\n"
+        f"{hbold('💳 Реквизиты:')}\n"
+        f"Карта: {'✅' if user['requisites']['card'] else '❌'}\n"
+        f"Телефон: {'✅' if user['requisites']['phone'] else '❌'}\n"
+        f"STARS: {'✅' if user['requisites']['stars'] else '❌'}\n"
+        f"TON: {'✅' if user['requisites']['ton_wallet'] else '❌'}\n"
+    )
+    
+    if active_deals:
+        profile_text += f"\n{hbold('📋 Активные сделки:')}\n"
+        for deal in active_deals[:5]:
+            status_emoji = {
+                DealStatus.PENDING.value: "⏳",
+                DealStatus.PAID.value: "💰",
+                DealStatus.NFT_SENT.value: "🎁"
+            }.get(deal['status'], "❓")
+            profile_text += f"{status_emoji} {deal['deal_id']} - {deal['amount']} {deal['currency']}\n"
+    
+    await callback.message.edit_text(
+        profile_text,
+        reply_markup=get_back_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_panel")
+async def admin_panel(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    
+    if user['role'] != UserRole.ADMIN.value:
+        await callback.answer("❌ У вас нет прав доступа к админ-панели")
+        return
+    
+    await callback.message.edit_text(
+        f"{hbold('👑 Административная панель')}\n\n"
+        f"Выберите действие:",
+        reply_markup=get_admin_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('currency_'), StateFilter(DealCreation.choosing_currency))
+async def process_currency(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.replace('currency_', '')
+    await state.update_data(currency=currency)
+    await state.set_state(DealCreation.entering_amount)
+    
+    await callback.message.edit_text(
+        f"Выбрана валюта: {SUPPORTED_CURRENCIES[currency]}\n\n"
+        f"Введите сумму сделки:"
+    )
+    await callback.answer()
+
+@dp.message(DealCreation.entering_amount)
+async def process_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректную положительную сумму")
+        return
+    
+    await state.update_data(amount=amount)
+    await state.set_state(DealCreation.entering_description)
+    await message.answer("🎁 Введите ссылку(-и) на подарок(-и) в одном из форматов: https://... или t.me/... Например: t.me/nft/DurovsCap-1")
+
+@dp.message(DealCreation.entering_description)
+async def process_description(message: types.Message, state: FSMContext):
+    description = message.text
+    await state.update_data(description=description)
+    
+    data = await state.get_data()
+    currency = data['currency']
+    amount = data['amount']
+    
+    confirm_text = (
+        f"{hbold('Подтверждение создания сделки:')}\n\n"
+        f"💱 Валюта: {SUPPORTED_CURRENCIES[currency]}\n"
+        f"💰 Сумма: {amount}\n"
+        f"📝 Описание: {description}\n\n"
+        f"Всё верно?"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="confirm_deal")
+    builder.button(text="❌ Отмена", callback_data="cancel")
+    
+    await state.set_state(DealCreation.confirming)
+    await message.answer(
+        confirm_text,
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(lambda c: c.data == "confirm_deal", StateFilter(DealCreation.confirming))
+async def confirm_deal(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    
+    deal_id = db.create_deal(
+        creator_id=callback.from_user.id,
+        currency=data['currency'],
+        amount=data['amount'],
+        description=data['description']
+    )
+    
+    await state.clear()
+    
+    # Генерируем ссылку на сделку
+    bot_username = (await callback.bot.me()).username
+    clean_deal_id = deal_id.replace('#', '')
+    deal_link = f"https://t.me/{bot_username}?start=deal_{clean_deal_id}"
+    
+    # Получаем реквизиты продавца
+    req = db.get_requisites(callback.from_user.id)
+    requisites_text = f"{hbold('💳 Ваши реквизиты для оплаты:')}\n"
+    
+    # Показываем только те реквизиты, которые есть
+    if req['card']:
+        masked_card = f"**** **** **** {req['card'][-4:]}"
+        requisites_text += f"💳 Карта: {masked_card}\n"
+    if req['phone']:
+        requisites_text += f"📱 Телефон (СБП): +{req['phone']}\n"
+    if req['stars']:
+        requisites_text += f"⭐ STARS: @{req['stars']}\n"
+    if req['ton_wallet']:
+        masked_wallet = f"{req['ton_wallet'][:4]}...{req['ton_wallet'][-4:]}"
+        requisites_text += f"💎 TON: {masked_wallet}\n"
+    
+    success_text = (
+        f"{hbold('✅ Сделка успешно создана!')}\n\n"
+        f"ID сделки: {hcode(deal_id)}\n"
+        f"💱 Валюта: {SUPPORTED_CURRENCIES[data['currency']]}\n"
+        f"💰 Сумма: {data['amount']}\n\n"
+        f"{requisites_text}\n"
+        f"Ссылка для покупателя:\n"
+        f"{deal_link}\n\n"
+        f"После оплаты вам нужно будет отправить NFT поддержке."
+    )
+    
+    await callback.message.edit_text(
+        success_text,
+        reply_markup=get_back_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('pay_'))
+async def process_pay(callback: types.CallbackQuery):
+    deal_id = callback.data.replace('pay_', '')
+    deal = db.get_deal(deal_id)
+    
+    if not deal:
+        await callback.answer("❌ Сделка не найдена")
+        return
+    if deal['status'] != DealStatus.PENDING.value:
+        await callback.answer("❌ Эта сделка уже не доступна для оплаты")
+        return
+    if deal['creator_id'] == callback.from_user.id:
+        await callback.answer("❌ Вы не можете оплатить свою сделку")
+        return
+    
+    # Обновляем сделку
+    db.update_deal(deal_id,
+                   buyer_id=callback.from_user.id,
+                   status=DealStatus.PAID.value,
+                   paid_at=datetime.now().isoformat())
+    
+    # Получаем информацию о покупателе
+    buyer = db.get_user(callback.from_user.id)
+    
+    # Создаем клавиатуру с кнопкой "Подарок отправлен" для продавца
+    seller_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎁 Подарок отправлен", callback_data=f"gift_sent_{deal_id}")
+    ]])
+    
+    # Уведомляем продавца
+    seller_id = deal['creator_id']
+    try:
+        seller_notification = (
+            f"{hbold('💰 Получена оплата по сделке!')}\n\n"
+            f"ID сделки: {hcode(deal_id)}\n"
+            f"Сумма: {deal['amount']} {SUPPORTED_CURRENCIES[deal['currency']]}\n\n"
+            f"Информация о покупателе:\n"
+            f"👤 Имя: {buyer['first_name']}\n"
+            f"📊 Успешных сделок: {buyer['successful_deals']}\n"
+            f"💰 Оборот: {buyer['total_turnover']} RUB\n\n"
+            f"Пожалуйста, отправьте NFT поддержке @supporOTC\n"
+            f"После отправки подарка нажмите кнопку ниже:"
+        )
+        await callback.bot.send_message(
+            seller_id, 
+            seller_notification, 
+            reply_markup=seller_keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Failed to notify seller: {e}")
+    
+    # Уведомляем покупателя
+    await callback.message.edit_text(
+        f"{hbold('✅ Оплата зарегистрирована!')}\n\n"
+        f"Продавец уведомлен. Ожидайте, пока он отправит подарок гаранту.\n"
+        f"После отправки вы получите уведомление.",
+        reply_markup=get_back_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('gift_sent_'))
+async def process_gift_sent(callback: types.CallbackQuery):
+    deal_id = callback.data.replace('gift_sent_', '')
+    deal = db.get_deal(deal_id)
+    
+    if not deal:
+        await callback.answer("❌ Сделка не найдена")
+        return
+    
+    if deal['creator_id'] != callback.from_user.id:
+        await callback.answer("❌ Вы не можете подтвердить отправку этой сделки")
+        return
+    
+    if deal['status'] != DealStatus.PAID.value:
+        await callback.answer("❌ Неверный статус сделки для подтверждения отправки")
+        return
+    
+    # Обновляем статус
+    db.update_deal(deal_id, 
+                   status=DealStatus.NFT_SENT.value,
+                   gift_sent_at=datetime.now().isoformat())
+    
+    # Уведомляем покупателя
+    if deal['buyer_id']:
+        try:
+            await callback.bot.send_message(
+                deal['buyer_id'],
+                f"{hbold('🎁 Продавец отправил подарок!')}\n\n"
+                f"ID сделки: {hcode(deal_id)}\n"
+                f"Продавец подтвердил передачу подарка гаранту.\n"
+                f"Ожидайте проверки от поддержки.",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+    
+    # Уведомляем продавца
+    await callback.message.edit_text(
+        f"{hbold('✅ Подтверждение получено!')}\n\n"
+        f"ID сделки: {hcode(deal_id)}\n"
+        f"Поддержка проверяет передачу подарка.\n"
+        f"Ожидайте завершения сделки.",
+        reply_markup=get_back_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+    
+    # Уведомляем админов
+    for admin_id in ADMIN_IDS.split(','):
+        try:
+            admin_id = int(admin_id.strip())
+            await callback.bot.send_message(
+                admin_id,
+                f"{hbold('🎁 Требуется проверка!')}\n\n"
+                f"Продавец подтвердил отправку подарка по сделке {hcode(deal_id)}\n"
+                f"Перейдите в админ-панель для завершения сделки.",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+
+# Админ панель обработчики
+@dp.callback_query(lambda c: c.data == "admin_stats")
+async def admin_stats(callback: types.CallbackQuery):
+    all_deals = db.get_all_deals()
+    active_deals = db.get_active_deals()
+    pending_deals = db.get_pending_deals()
+    completed_deals = [d for d in all_deals if d['status'] == DealStatus.COMPLETED.value]
+    
+    total_turnover = sum(d['amount'] for d in completed_deals if d['currency'] == 'TON')
+    total_users = len(db.users)
+    
+    stats_text = (
+        f"{hbold('📊 Общая статистика')}\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"📦 Всего сделок: {len(all_deals)}\n"
+        f"🔄 Активных сделок: {len(active_deals)}\n"
+        f"⏳ Ожидают оплаты: {len(pending_deals)}\n"
+        f"✅ Завершено сделок: {len(completed_deals)}\n"
+        f"💰 Общий оборот (TON): {total_turnover}\n\n"
+        f"По валютам:\n"
+    )
+    
+    for currency in SUPPORTED_CURRENCIES:
+        currency_deals = [d for d in completed_deals if d['currency'] == currency]
+        currency_sum = sum(d['amount'] for d in currency_deals)
+        stats_text += f"{SUPPORTED_CURRENCIES[currency]}: {currency_sum}\n"
+    
+    await callback.message.edit_text(stats_text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_deals")
+async def admin_deals_list(callback: types.CallbackQuery):
+    active_deals = db.get_active_deals()
+    
+    if not active_deals:
+        await callback.message.edit_text("❌ Нет активных сделок", reply_markup=get_back_keyboard())
+        await callback.answer()
+        return
+    
+    text = f"{hbold('📋 Активные сделки:')}\n\n"
+    builder = InlineKeyboardBuilder()
+    
+    for deal in active_deals[:10]:
+        status_emoji = {
+            DealStatus.PENDING.value: "⏳",
+            DealStatus.PAID.value: "💰",
+            DealStatus.NFT_SENT.value: "🎁"
+        }.get(deal['status'], "❓")
+        
+        text += f"{status_emoji} {deal['deal_id']} - {deal['amount']} {deal['currency']}\n"
+        builder.button(text=deal['deal_id'], callback_data=f"admin_deal_{deal['deal_id']}")
+    
+    builder.button(text="🔙 Назад", callback_data="admin_back")
+    builder.adjust(3)
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("admin_deal_"))
+async def admin_deal_detail(callback: types.CallbackQuery):
+    deal_id = callback.data.replace("admin_deal_", "")
+    deal = db.get_deal(deal_id)
+    
+    if not deal:
+        await callback.message.edit_text("❌ Сделка не найдена", reply_markup=get_back_keyboard())
+        await callback.answer()
+        return
+    
+    creator = db.get_user(deal['creator_id'])
+    buyer = db.get_user(deal['buyer_id']) if deal['buyer_id'] else None
+    
+    deal_text = (
+        f"{hbold(f'Сделка {deal_id}')}\n\n"
+        f"Статус: {deal['status']}\n"
+        f"💱 Валюта: {SUPPORTED_CURRENCIES[deal['currency']]}\n"
+        f"💰 Сумма: {deal['amount']}\n"
+        f"📝 Описание: {deal['description']}\n\n"
+        f"👤 Продавец: {creator['first_name']} (@{creator['username']})\n"
+        f"📊 Статистика продавца: {creator['successful_deals']} сделок, {creator['total_turnover']} RUB\n"
+    )
+    
+    if buyer:
+        deal_text += f"\n👤 Покупатель: {buyer['first_name']} (@{buyer['username']})\n"
+        deal_text += f"📊 Статистика покупателя: {buyer['successful_deals']} сделок, {buyer['total_turnover']} RUB\n"
+    
+    if deal['paid_at']:
+        deal_text += f"\n💰 Оплачено: {deal['paid_at']}\n"
+    if deal['gift_sent_at']:
+        deal_text += f"🎁 Подарок отправлен: {deal['gift_sent_at']}\n"
+    
+    await callback.message.edit_text(
+        deal_text,
+        reply_markup=get_deal_actions_keyboard(deal_id, UserRole.ADMIN.value, callback.from_user.id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("admin_complete_"))
+async def admin_complete_deal(callback: types.CallbackQuery):
+    deal_id = callback.data.replace("admin_complete_", "")
+    deal = db.get_deal(deal_id)
+    
+    if not deal:
+        await callback.answer("❌ Сделка не найдена")
+        return
+    
+    db.update_deal(deal_id, 
+                   status=DealStatus.COMPLETED.value,
+                   completed_at=datetime.now().isoformat())
+    
+    # Обновляем статистику продавца
+    seller = db.get_user(deal['creator_id'])
+    db.update_user(
+        deal['creator_id'],
+        successful_deals=seller['successful_deals'] + 1,
+        total_turnover=seller['total_turnover'] + deal['amount']
+    )
+    
+    # Обновляем статистику покупателя
+    if deal['buyer_id']:
+        buyer = db.get_user(deal['buyer_id'])
+        db.update_user(
+            deal['buyer_id'],
+            successful_deals=buyer['successful_deals'] + 1
+        )
+    
+    # Уведомляем участников
+    for user_id in [deal['creator_id'], deal['buyer_id']]:
+        if user_id:
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"{hbold('✅ Сделка успешно завершена!')}\n\n"
+                    f"ID сделки: {hcode(deal_id)}\n"
+                    f"Спасибо за использование нашего сервиса!",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+    
+    await callback.message.edit_text(
+        f"✅ Сделка {deal_id} успешно завершена!",
+        reply_markup=get_admin_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_add_turnover")
+async def admin_add_turnover_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminActions.adding_balance)
+    await callback.message.edit_text(
+        "Введите ID пользователя и сумму оборота для накрутки (в формате: ID СУММА):\n"
+        "Пример: 123456789 1000"
+    )
+    await callback.answer()
+
+@dp.message(AdminActions.adding_balance)
+async def admin_add_turnover_process(message: types.Message, state: FSMContext):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            raise ValueError
+            
+        user_id = int(parts[0])
+        amount = float(parts[1])
+        
+        user = db.get_user(user_id)
+        db.update_user(user_id, total_turnover=user['total_turnover'] + amount)
+        
+        await message.answer(f"✅ Оборот пользователя {user_id} увеличен на {amount}")
+    except:
+        await message.answer("❌ Неправильный формат. Используйте: ID СУММА")
+    
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "admin_add_success")
+async def admin_add_success_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminActions.adding_successful_deals)
+    await callback.message.edit_text(
+        "Введите ID пользователя и количество успешных сделок для накрутки (в формате: ID КОЛИЧЕСТВО):\n"
+        "Пример: 123456789 5"
+    )
+    await callback.answer()
+
+@dp.message(AdminActions.adding_successful_deals)
+async def admin_add_success_process(message: types.Message, state: FSMContext):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            raise ValueError
+            
+        user_id = int(parts[0])
+        count = int(parts[1])
+        
+        user = db.get_user(user_id)
+        db.update_user(user_id, successful_deals=user['successful_deals'] + count)
+        
+        await message.answer(f"✅ Успешные сделки пользователя {user_id} увеличены на {count}")
+    except:
+        await message.answer("❌ Неправильный формат. Используйте: ID КОЛИЧЕСТВО")
+    
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "admin_users")
+async def admin_users_list(callback: types.CallbackQuery):
+    users_text = f"{hbold('👥 Список пользователей:')}\n\n"
+    
+    for user_id, user_data in list(db.users.items())[:20]:
+        users_text += f"ID: {user_id} | @{user_data['username']} | Сделок: {user_data['successful_deals']} | Оборот: {user_data['total_turnover']}\n"
+    
+    await callback.message.edit_text(users_text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_broadcast")
+async def admin_broadcast_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminActions.sending_broadcast)
+    await callback.message.edit_text(
+        "Введите сообщение для рассылки всем пользователям:"
+    )
+    await callback.answer()
+
+@dp.message(AdminActions.sending_broadcast)
+async def admin_broadcast_process(message: types.Message, state: FSMContext):
+    broadcast_text = message.text
+    sent_count = 0
+    failed_count = 0
+    
+    for user_id in db.users.keys():
+        try:
+            await bot.send_message(
+                user_id,
+                f"{hbold('📢 Рассылка от администрации:')}\n\n{broadcast_text}",
+                parse_mode="HTML"
+            )
+            sent_count += 1
+            await asyncio.sleep(0.05)
+        except:
+            failed_count += 1
+    
+    await message.answer(
+        f"✅ Рассылка завершена!\n"
+        f"Отправлено: {sent_count}\n"
+        f"Не доставлено: {failed_count}"
+    )
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "admin_back")
+async def admin_back(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        f"{hbold('👑 Административная панель')}\n\n"
+        f"Выберите действие:",
+        reply_markup=get_admin_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "cancel")
+async def cancel_action(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        f"{hbold('🛡 Playerok Bot | OTC')}\n\n"
+        f"{hbold('👇 Выберите действие:')}",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("refresh_"))
+async def refresh_deal(callback: types.CallbackQuery):
+    deal_id = callback.data.replace("refresh_", "")
+    deal = db.get_deal(deal_id)
+    
+    if not deal:
+        await callback.answer("❌ Сделка не найдена")
+        return
+    
+    user = db.get_user(callback.from_user.id)
+    await callback.message.edit_reply_markup(
+        reply_markup=get_deal_actions_keyboard(deal_id, user['role'], callback.from_user.id)
+    )
+    await callback.answer("🔄 Данные обновлены")
+
+@dp.message()
+async def handle_unknown(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer(
+        "❌ Я не понимаю эту команду.\n"
+        "Используйте кнопки ниже для навигации:",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
+async def main():
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
